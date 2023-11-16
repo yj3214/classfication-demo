@@ -4,7 +4,11 @@ import random
 import sys
 import torch
 from tqdm import tqdm
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
 from torch.utils.data import Dataset
+import SimpleITK as sitk
 class MyDataset(Dataset):
     def __init__(self, data,transform=None):
         self.data = data
@@ -127,3 +131,91 @@ def evaluate(model, data_loader, device, epoch):
                                                                                accu_loss.item() / (step + 1),
                                                                                accu_num.item() / sample_num)
     return accu_loss.item() / (step + 1), accu_num.item() / sample_num
+
+
+def hu2uint8(image, HU_min=-1200.0, HU_max=600.0, HU_nan=-2000.0):
+    """
+    Convert HU unit into uint8 values. First bound HU values by predfined min
+    and max, and then normalize
+    image: 3D numpy array of raw HU values from CT series in [z, y, x] order.
+    HU_min: float, min HU value.
+    HU_max: float, max HU value.
+    HU_nan: float, value for nan in the raw CT image.
+    """
+    image_new = np.array(image)
+    image_new[np.isnan(image_new)] = HU_nan
+
+    # normalize to [0, 1]
+    image_new = (image_new - HU_min) / (HU_max - HU_min)
+    image_new = np.clip(image_new, 0, 1)
+    image_new = (image_new * 255).astype('uint8')
+
+    return image_new
+def dicom2img(dcm_image, window_center, window_width):
+    """
+    将一张脑CT切片变换为一幅图像
+    """
+    assert (isinstance(window_center, int) and isinstance(window_width, int)) or \
+           (len(window_center) == len(window_width))
+
+    if isinstance(window_center, int):
+        window_center = [window_center]
+        window_width = [window_width]
+        channel = 1
+    else:
+        channel = len(window_center)
+
+    img = np.zeros(list(dcm_image.shape) + [channel], dtype="uint8")
+    for i, (c, w) in enumerate(zip(window_center, window_width)):
+        HU_min, HU_max = c - w // 2, c + w // 2
+        img[..., i] = hu2uint8(dcm_image, HU_min=HU_min, HU_max=HU_max)
+    return img
+
+def load_dcm(sorted_dcm_list):
+    """
+    Return img array and [z,y,x]-ordered origin and spacing
+    """
+    itkimage = sitk.ReadImage(sorted_dcm_list)
+    numpyImage = sitk.GetArrayFromImage(itkimage)
+
+    numpyOrigin = np.array(list(reversed(itkimage.GetOrigin())))
+    numpySpacing = np.array(list(reversed(itkimage.GetSpacing())))
+
+    return numpyImage, numpyOrigin, numpySpacing
+def remove_black_edge(img):
+    """
+    去除脑CT切片图像中的黑边
+    img: H, W, C
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    close = cv2.morphologyEx(img[..., 0], cv2.MORPH_OPEN, kernel, iterations=3)
+    if close.sum() > 0:
+        (hmin, hmax), (wmin, wmax) = map(lambda x: (x.min(), x.max()), np.where(close > 0))
+        return img[hmin:hmax, wmin:wmax]
+    else:
+        return np.zeros_like(img)
+
+def preprocess(dicom_dir):
+    """
+    对dicom格式的图像进行预处理
+    return array数组
+    """
+    sitk.ProcessObject_SetGlobalWarningDisplay(False)
+    slice_ids = os.listdir(dicom_dir)
+    dcm_list = [os.path.join(dicom_dir, i) for i in slice_ids]
+    dcm_image, origin, spacing = load_dcm(dcm_list)
+    # brain, subdural, bone
+    img = dicom2img(dcm_image, window_center=[40, 80, 40], window_width=[80, 200, 380])
+    # remove black boundary
+    box = np.where(img > 0)
+    y_min, y_max, x_min, x_max = box[1].min(), box[1].max(), box[2].min(), box[2].max()
+    img = img[:, y_min:y_max, x_min:x_max]
+    return img
+
+
+if __name__ == '__main__':
+    dcm_file = r'E:\medical\chen\1_A'
+    img = preprocess(dcm_file)
+    print(img.shape)
+    plt.imshow(img[10])
+    plt.show()
